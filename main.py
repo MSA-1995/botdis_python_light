@@ -745,11 +745,15 @@ def ytdlp_download(track: dict[str, str]) -> str:
     safe_id = uuid.uuid4().hex
     outtmpl = str(download_dir / f"{safe_id}.%(ext)s")
     options = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
         "quiet": True,
         "noplaylist": True,
         "outtmpl": outtmpl,
         "windowsfilenames": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "skip_unavailable_fragments": True,
+        "ignoreerrors": False,
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(track["webpage_url"], download=True)
@@ -770,7 +774,7 @@ def get_ffmpeg_executable() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-async def play_next(session: MusicSession) -> None:
+async def play_next(session: MusicSession, retry_count: int = 0) -> None:
     voice_client = get_session_voice_client(session)
     if not voice_client or not voice_client.is_connected():
         return
@@ -794,33 +798,70 @@ async def play_next(session: MusicSession) -> None:
 
     before_options = "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
     ffmpeg_executable = get_ffmpeg_executable()
-    if MUSIC_AUDIO_MODE == "opus":
-        source = await discord.FFmpegOpusAudio.from_probe(
-            source_path,
-            executable=ffmpeg_executable,
-            method="fallback",
-            before_options="" if temp_file else before_options,
-            options="-vn -b:a 128k",
-        )
-    else:
-        source = discord.FFmpegPCMAudio(
-            source_path,
-            executable=ffmpeg_executable,
-            before_options="" if temp_file else before_options,
-            options="-vn -loglevel warning",
-        )
+    
+    try:
+        if MUSIC_AUDIO_MODE == "opus":
+            source = await discord.FFmpegOpusAudio.from_probe(
+                source_path,
+                executable=ffmpeg_executable,
+                method="fallback",
+                before_options="" if temp_file else before_options,
+                options="-vn -b:a 128k",
+            )
+        else:
+            source = discord.FFmpegPCMAudio(
+                source_path,
+                executable=ffmpeg_executable,
+                before_options="" if temp_file else before_options,
+                options="-vn -loglevel warning",
+            )
+    except Exception as exc:
+        print(f"FFmpeg source creation failed: {type(exc).__name__}: {exc}")
+        if temp_file:
+            try:
+                Path(temp_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+        await play_next(session)
+        return
 
     def after(error: Exception | None) -> None:
+        if temp_file:
+            try:
+                Path(temp_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+        
         if error:
+            error_str = str(error)
             print(f"Music playback error in voice {session.voice_channel_id}: {error}")
+            
+            # إذا كان خطأ FFmpeg crash (-11, -9, etc.) نحاول مرة ثانية
+            if "code -11" in error_str or "code -9" in error_str or "code 1" in error_str:
+                if retry_count < 2:
+                    print(f"Retrying playback (attempt {retry_count + 2}/3)...")
+                    # نرجع الأغنية للقائمة ونحاول مرة ثانية
+                    session.queue.appendleft(track)
+                    bot.loop.call_soon_threadsafe(
+                        asyncio.create_task, 
+                        play_next(session, retry_count + 1)
+                    )
+                    return
+        
+        bot.loop.call_soon_threadsafe(asyncio.create_task, play_next(session))
+
+    try:
+        voice_client.play(source, after=after)
+    except Exception as exc:
+        print(f"voice_client.play() failed: {type(exc).__name__}: {exc}")
         if temp_file:
             try:
                 Path(temp_file).unlink(missing_ok=True)
             except OSError:
                 pass
         bot.loop.call_soon_threadsafe(asyncio.create_task, play_next(session))
-
-    voice_client.play(source, after=after)
+        return
+        
     if session.text_channel_id:
         channel = bot.get_channel(session.text_channel_id)
         if channel and hasattr(channel, "send"):
