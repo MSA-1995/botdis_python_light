@@ -35,9 +35,9 @@ DEFAULT_BITRATE = int(os.getenv("DEFAULT_BITRATE", "64000") or 64000)
 AUTO_DELETE_DELAY = int(os.getenv("AUTO_DELETE_DELAY", "3") or 3)
 CREATE_COOLDOWN = 5
 MUSIC_SEARCH_PROVIDER = os.getenv("MUSIC_SEARCH_PROVIDER", "soundcloud").strip().lower()
-MUSIC_AUDIO_MODE = os.getenv("MUSIC_AUDIO_MODE", "pcm").strip().lower()
+MUSIC_AUDIO_MODE = os.getenv("MUSIC_AUDIO_MODE", "opus").strip().lower()  # opus أفضل من pcm
 MUSIC_DOWNLOAD_BEFORE_PLAY = os.getenv("MUSIC_DOWNLOAD_BEFORE_PLAY", "true").strip().lower() in {"1", "true", "yes", "on"}
-APP_VERSION = "2026-05-22.3"
+APP_VERSION = "2026-05-24.1"
 INSTANCE_ID = os.getenv("KOYEB_DEPLOYMENT_ID") or os.getenv("HOSTNAME") or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
 INSTANCE_STARTED_AT = time.time()
 INSTANCE_LOCK_CHANNEL_ID = int(os.getenv("INSTANCE_LOCK_CHANNEL_ID", "0") or 0)
@@ -761,17 +761,32 @@ def ytdlp_download(track: dict[str, str]) -> str:
 
 
 def get_ffmpeg_executable() -> str:
+    # أولاً: تحقق من المتغير البيئي
     configured = os.getenv("FFMPEG_EXECUTABLE", "").strip()
-    if configured:
+    if configured and shutil.which(configured):
         return configured
 
+    # ثانياً: FFmpeg المثبت على النظام (الأفضل والأكثر استقراراً)
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
         return system_ffmpeg
+    
+    # ثالثاً: المسارات المعروفة على Heroku/Koyeb
+    known_paths = [
+        "/usr/bin/ffmpeg",
+        "/app/.apt/usr/bin/ffmpeg",
+        "/workspace/.apt/usr/bin/ffmpeg",
+    ]
+    for path in known_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
 
-    import imageio_ffmpeg
-
-    return imageio_ffmpeg.get_ffmpeg_exe()
+    # أخيراً: imageio_ffmpeg كـ fallback (أقل استقراراً)
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        return "ffmpeg"  # نأمل إنه موجود في PATH
 
 
 async def play_next(session: MusicSession, retry_count: int = 0) -> None:
@@ -801,19 +816,21 @@ async def play_next(session: MusicSession, retry_count: int = 0) -> None:
     
     try:
         if MUSIC_AUDIO_MODE == "opus":
+            # Opus mode - أفضل للاستقرار وأقل استهلاك للموارد
             source = await discord.FFmpegOpusAudio.from_probe(
                 source_path,
                 executable=ffmpeg_executable,
                 method="fallback",
-                before_options="" if temp_file else before_options,
-                options="-vn -b:a 128k",
+                before_options="-nostdin" if temp_file else before_options,
+                options="-vn -b:a 96k -ar 48000 -ac 2",
             )
         else:
+            # PCM mode - جودة أعلى لكن أقل استقراراً
             source = discord.FFmpegPCMAudio(
                 source_path,
                 executable=ffmpeg_executable,
-                before_options="" if temp_file else before_options,
-                options="-vn -loglevel warning",
+                before_options="-nostdin" if temp_file else before_options,
+                options="-vn -ar 48000 -ac 2 -f s16le -loglevel warning",
             )
     except Exception as exc:
         print(f"FFmpeg source creation failed: {type(exc).__name__}: {exc}")
